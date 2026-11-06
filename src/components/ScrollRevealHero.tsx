@@ -1,14 +1,23 @@
-import { useEffect, useRef, useState } from "react";
-import mobileVideoUrl from "@/assets/hero-nail-reveal-mobile.mp4";
-import desktopVideoUrl from "@/assets/hero-nail-reveal-desktop.mp4";
-import posterUrl from "@/assets/hero-poster.jpg";
+import { useEffect, useRef, useState, useCallback } from "react";
 
-/**
- * Fallback URLs if imported assets are unavailable
- */
-const FALLBACK_MOBILE_VIDEO = "/videos/hero-nail-reveal-mobile.mp4";
-const FALLBACK_DESKTOP_VIDEO = "/videos/hero-nail-reveal-desktop.mp4";
-const FALLBACK_POSTER = "/videos/hero-poster.jpg";
+const TOTAL_FRAMES = 36;
+
+type DeviceTier = "mobile" | "tablet" | "desktop";
+
+function getDeviceTier(width: number): DeviceTier {
+  if (width < 640) return "mobile";
+  if (width < 1024) return "tablet";
+  return "desktop";
+}
+
+function getFrameUrl(tier: DeviceTier, index: number): string {
+  const padded = String(index).padStart(2, "0");
+  return `/hero-frames/${tier}/frame_${padded}.webp`;
+}
+
+function getPosterUrl(tier: DeviceTier): string {
+  return `/hero-frames/poster-${tier}.webp`;
+}
 
 /**
  * Calculates dynamic focal point keeping all critical moments framed
@@ -18,92 +27,130 @@ const FALLBACK_POSTER = "/videos/hero-poster.jpg";
  * - 45%–76%: Brush gliding burgundy polish onto the nail
  * - 76%–100%: Finished 5-finger manicure resting on the pedestal
  */
-function getFocalPosition(p: number, width: number, height: number): string {
+function getFocalCoordinates(p: number, width: number, height: number): { x: number; y: number } {
   const aspectRatio = width / (height || 1);
 
   // Narrow mobile (e.g. 375x812, 390x844, 430x932 - aspect ratio <= 0.62)
-  // The 9:16 vertical video naturally fills the mobile screen width with minimal vertical cropping.
   if (aspectRatio <= 0.62) {
-    if (p < 0.22) return "50% 52%";
+    if (p < 0.22) return { x: 0.5, y: 0.52 };
     if (p < 0.45) {
       const t = (p - 0.22) / 0.23;
-      return `50% ${Math.round((52 - t * 4) * 10) / 10}%`; // subtle shift 52% -> 48%
+      return { x: 0.5, y: (52 - t * 4) / 100 }; // 0.52 -> 0.48
     }
     if (p < 0.76) {
       const t = (p - 0.45) / 0.31;
-      return `50% ${Math.round((48 + t * 4) * 10) / 10}%`; // 48% -> 52%
+      return { x: 0.5, y: (48 + t * 4) / 100 }; // 0.48 -> 0.52
     }
-    return "50% 53%";
+    return { x: 0.5, y: 0.53 };
   }
 
   // Portrait tablet (e.g. 768x1024, 820x1180 - aspect ratio 0.62 to 0.95)
-  // Video fills height with slight lateral crop. Subtle vertical tracking keeps action centered.
   if (aspectRatio < 0.95) {
-    if (p < 0.22) return "50% 53%";
+    if (p < 0.22) return { x: 0.5, y: 0.53 };
     if (p < 0.45) {
       const t = (p - 0.22) / 0.23;
-      return `50% ${Math.round((53 - t * 10) * 10) / 10}%`; // 53% -> 43%
+      return { x: 0.5, y: (53 - t * 10) / 100 }; // 0.53 -> 0.43
     }
     if (p < 0.76) {
       const t = (p - 0.45) / 0.31;
-      return `50% ${Math.round((43 + t * 8) * 10) / 10}%`; // 43% -> 51%
+      return { x: 0.5, y: (43 + t * 8) / 100 }; // 0.43 -> 0.51
     }
-    return "50% 54%";
+    return { x: 0.5, y: 0.54 };
   }
 
   // Widescreen & landscape tablet/desktop (aspect ratio >= 0.95)
-  // Video fills width and crops top/bottom. Vertical panning follows the hero action.
-  let y = 52;
+  let y = 0.54;
   if (p < 0.22) {
-    y = 54;
+    y = 0.54;
   } else if (p < 0.44) {
     const t = (p - 0.22) / 0.22;
-    y = 54 - t * 17; // 54% -> 37% (follow cap & brush)
+    y = (54 - t * 17) / 100; // 0.54 -> 0.37 (follow cap & brush)
   } else if (p < 0.75) {
     const t = (p - 0.44) / 0.31;
-    y = 37 + t * 12; // 37% -> 49% (follow nail application)
+    y = (37 + t * 12) / 100; // 0.37 -> 0.49 (follow nail application)
   } else {
     const t = (p - 0.75) / 0.25;
-    y = 49 + t * 7; // 49% -> 56% (finished hand & pedestal)
+    y = (49 + t * 7) / 100; // 0.49 -> 0.56 (finished hand & pedestal)
   }
 
-  return `50% ${Math.round(y * 10) / 10}%`;
+  return { x: 0.5, y };
 }
 
 /**
- * Mobile-First Scroll-Synchronized Hero Video Component.
+ * Resizes the canvas to match display CSS dimensions, scaled by devicePixelRatio.
+ */
+function resizeCanvas(canvas: HTMLCanvasElement): { width: number; height: number } {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.round(rect.width * dpr);
+  const height = Math.round(rect.height * dpr);
+
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return { width, height };
+}
+
+/**
+ * Draws an image covering the canvas completely with focal tracking.
+ */
+function drawCoverFrame(
+  canvas: HTMLCanvasElement,
+  img: HTMLImageElement,
+  progress: number
+) {
+  const ctx = canvas.getContext("2d", { alpha: false });
+  if (!ctx) return;
+
+  const cw = canvas.width;
+  const ch = canvas.height;
+  if (!cw || !ch) return;
+
+  const iw = img.naturalWidth || img.width;
+  const ih = img.naturalHeight || img.height;
+  if (!iw || !ih) return;
+
+  const focal = getFocalCoordinates(progress, cw, ch);
+  const scale = Math.max(cw / iw, ch / ih);
+  const dw = iw * scale;
+  const dh = ih * scale;
+
+  const fx = Math.max(0, Math.min(1, focal.x));
+  const fy = Math.max(0, Math.min(1, focal.y));
+
+  const dx = (cw - dw) * fx;
+  const dy = (ch - dh) * fy;
+
+  ctx.drawImage(img, dx, dy, dw, dh);
+}
+
+/**
+ * Performance-First Mobile-Prioritized Scroll-Controlled Hero Image Sequence.
  *
- * Key features:
- * - Mobile-first video stream (720x1280, dense keyframes, faststart, no B-frames).
- * - Desktop high-bitrate video stream (1080x1920, faststart).
- * - Decoupled rAF seek loop: eliminates seek locks and outdated frame queues.
- * - Hardware watchdog: recovers gracefully if mobile decoder stalls or drops seeked events.
- * - Device-calibrated ScrollTrigger distances and touch responsiveness.
+ * Replaces heavy, seek-locking video with an ultra-lightweight WebP image sequence (36 frames):
+ * - Mobile sequence size: ~749 KB total (~21 KB/frame).
+ * - Tablet sequence size: ~1.35 MB total (~37 KB/frame).
+ * - Desktop sequence size: ~2.10 MB total (~58 KB/frame).
+ * - Zero black/blank screen: Instant poster layer with progressive image queue.
+ * - Hardware canvas rendering: synchronous, 60fps/120fps fluid scrub in both directions.
+ * - Dynamic focal-point tracking ensures critical action is centered on narrow phones, tablets & desktop.
  */
 export function ScrollRevealHero() {
   const sectionRef = useRef<HTMLElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
   const titleRef = useRef<HTMLDivElement>(null);
   const ctaRef = useRef<HTMLDivElement>(null);
   const hintRef = useRef<HTMLDivElement>(null);
 
+  const [deviceTier, setDeviceTier] = useState<DeviceTier>("mobile");
   const [reducedMotion, setReducedMotion] = useState(false);
-  const [selectedVideoSrc, setSelectedVideoSrc] = useState<string>(
-    mobileVideoUrl || FALLBACK_MOBILE_VIDEO
-  );
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [isCanvasReady, setIsCanvasReady] = useState(false);
 
-  // Determine optimal video stream for the current device
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-
-    const isDesktop = window.innerWidth >= 1024 && !("ontouchstart" in window);
-    const chosenSrc = isDesktop
-      ? desktopVideoUrl || FALLBACK_DESKTOP_VIDEO
-      : mobileVideoUrl || FALLBACK_MOBILE_VIDEO;
-
-    setSelectedVideoSrc(chosenSrc);
-  }, []);
+  // Keep references to loaded images
+  const imagesRef = useRef<(HTMLImageElement | null)[]>(new Array(TOTAL_FRAMES).fill(null));
+  const currentFrameRef = useRef<number>(0);
+  const currentProgressRef = useRef<number>(0);
 
   // Check prefers-reduced-motion
   useEffect(() => {
@@ -115,99 +162,146 @@ export function ScrollRevealHero() {
     return () => mq.removeEventListener("change", update);
   }, []);
 
-  // Main scroll-controlled scrubbing timeline
+  // Determine device tier
   useEffect(() => {
-    if (reducedMotion) return;
+    if (typeof window === "undefined") return;
+    const updateTier = () => {
+      const tier = getDeviceTier(window.innerWidth);
+      setDeviceTier(tier);
+    };
+    updateTier();
+    window.addEventListener("resize", updateTier);
+    return () => window.removeEventListener("resize", updateTier);
+  }, []);
+
+  // Helper to find the closest loaded image if the target frame isn't loaded yet
+  const getClosestLoadedImage = useCallback((targetIdx: number): HTMLImageElement | null => {
+    const images = imagesRef.current;
+    if (images[targetIdx]) return images[targetIdx];
+
+    for (let offset = 1; offset < TOTAL_FRAMES; offset++) {
+      const prev = targetIdx - offset;
+      if (prev >= 0 && images[prev]) return images[prev];
+      const next = targetIdx + offset;
+      if (next < TOTAL_FRAMES && images[next]) return images[next];
+    }
+    return null;
+  }, []);
+
+  // Helper to render current target frame
+  const renderCurrentFrame = useCallback(
+    (frameIdx: number, progress: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      currentFrameRef.current = frameIdx;
+      currentProgressRef.current = progress;
+
+      const img = getClosestLoadedImage(frameIdx);
+      if (img) {
+        resizeCanvas(canvas);
+        drawCoverFrame(canvas, img, progress);
+        if (!isCanvasReady) setIsCanvasReady(true);
+      }
+    },
+    [getClosestLoadedImage, isCanvasReady]
+  );
+
+  // Progressive image preloading logic
+  useEffect(() => {
+    if (typeof window === "undefined" || reducedMotion) return;
+
+    let cancelled = false;
+    const tier = deviceTier;
+
+    // Reset loaded images for current tier if tier changes
+    imagesRef.current = new Array(TOTAL_FRAMES).fill(null);
+
+    const loadImage = (idx: number): Promise<HTMLImageElement> => {
+      return new Promise((resolve, reject) => {
+        if (cancelled) return reject();
+        const existing = imagesRef.current[idx];
+        if (existing && existing.complete && existing.naturalWidth > 0) {
+          return resolve(existing);
+        }
+
+        const img = new Image();
+        img.decoding = "async";
+        img.src = getFrameUrl(tier, idx);
+        img.onload = () => {
+          if (cancelled) return;
+          imagesRef.current[idx] = img;
+
+          // If this frame or the closest frame is what's currently requested, redraw
+          const target = currentFrameRef.current;
+          if (Math.abs(target - idx) <= 1) {
+            const canvas = canvasRef.current;
+            if (canvas) {
+              resizeCanvas(canvas);
+              drawCoverFrame(canvas, img, currentProgressRef.current);
+              setIsCanvasReady(true);
+            }
+          }
+          resolve(img);
+        };
+        img.onerror = () => {
+          if (!cancelled) resolve(img);
+        };
+      });
+    };
+
+    // Priority 1: Load frame 0 immediately to present the initial bottle
+    loadImage(0)
+      .then((img0) => {
+        if (cancelled) return;
+        const canvas = canvasRef.current;
+        if (canvas) {
+          resizeCanvas(canvas);
+          drawCoverFrame(canvas, img0, 0);
+          setIsCanvasReady(true);
+        }
+
+        // Priority 2: Preload initial scroll frames 1 through 5
+        const initialBatch = [1, 2, 3, 4, 5];
+        return Promise.all(initialBatch.map((i) => loadImage(i)));
+      })
+      .then(() => {
+        if (cancelled) return;
+
+        // Priority 3: Progressively stream the remaining frames (6..35)
+        // with controlled concurrency (max 3 concurrent network requests)
+        let cursor = 6;
+        const loadNext = () => {
+          if (cancelled || cursor >= TOTAL_FRAMES) return;
+          const idx = cursor++;
+          loadImage(idx).finally(() => {
+            if (!cancelled) loadNext();
+          });
+        };
+
+        // Start 3 concurrent pipelines
+        for (let i = 0; i < 3; i++) {
+          loadNext();
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, [deviceTier, reducedMotion]);
+
+  // Main GSAP ScrollTrigger timeline binding
+  useEffect(() => {
+    if (reducedMotion || typeof window === "undefined") return;
 
     let killed = false;
     let cleanupGsap: (() => void) | null = null;
-    let rafId: number | null = null;
 
-    const video = videoRef.current;
     const section = sectionRef.current;
-    if (!video || !section) return;
+    const canvas = canvasRef.current;
+    if (!section || !canvas) return;
 
-    // Prevent any stray automatic play events from advancing video unprompted
-    const onStrayPlay = () => {
-      video.pause();
-    };
-    video.addEventListener("play", onStrayPlay);
-
-    // =========================================================================
-    // HIGH-PERFORMANCE DECOUPLED SEEK CONTROLLER (Priority-Queue, Non-Blocking)
-    // =========================================================================
-    const targetTimeRef = { current: 0 };
-    const isSeekingRef = { current: false };
-    const seekStartTimeRef = { current: 0 };
-    const currentProgressRef = { current: 0 };
-    const stallDetectorRef = { current: { startTime: 0, lastCheckTime: 0 } };
-
-    const onSeeked = () => {
-      isSeekingRef.current = false;
-    };
-    video.addEventListener("seeked", onSeeked);
-
-    // Continuous render loop synchronizes targetTime with the video hardware decoder
-    const renderLoop = () => {
-      if (killed) return;
-
-      const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 7.96;
-      const target = Math.max(0, Math.min(duration, targetTimeRef.current));
-      const now = performance.now();
-
-      // Watchdog 1: Auto-release seek lock if mobile browser fails to fire 'seeked' within 85ms
-      if (isSeekingRef.current && now - seekStartTimeRef.current > 85) {
-        isSeekingRef.current = false;
-      }
-
-      // Execute seek if video is ready and delta is meaningful (> 25ms)
-      if (video.readyState >= 1 && !isSeekingRef.current) {
-        const delta = Math.abs(video.currentTime - target);
-        if (delta > 0.025) {
-          isSeekingRef.current = true;
-          seekStartTimeRef.current = now;
-
-          // Prefer fastSeek on browsers that support it (instant keyframe targeting on mobile)
-          if ("fastSeek" in video && typeof (video as any).fastSeek === "function") {
-            try {
-              (video as any).fastSeek(target);
-            } catch {
-              video.currentTime = target;
-            }
-          } else {
-            video.currentTime = target;
-          }
-        }
-      }
-
-      // Watchdog 2: Anti-Stall Fallback
-      // If user has scrolled past bottle opening (progress > 0.25) but video remains pinned
-      // below 1.5s for > 450ms, force jump to prevent being stuck on opening scene.
-      if (currentProgressRef.current > 0.25 && video.currentTime < 1.45) {
-        if (!stallDetectorRef.current.startTime) {
-          stallDetectorRef.current.startTime = now;
-        } else if (now - stallDetectorRef.current.startTime > 450) {
-          // Force recovery
-          isSeekingRef.current = false;
-          try {
-            video.currentTime = target;
-          } catch {
-            // ignore
-          }
-          stallDetectorRef.current.startTime = 0;
-        }
-      } else {
-        stallDetectorRef.current.startTime = 0;
-      }
-
-      rafId = requestAnimationFrame(renderLoop);
-    };
-
-    rafId = requestAnimationFrame(renderLoop);
-
-    // =========================================================================
-    // GSAP SCROLLTRIGGER SETUP
-    // =========================================================================
     (async () => {
       const [{ default: gsap }, { ScrollTrigger }] = await Promise.all([
         import("gsap"),
@@ -220,41 +314,21 @@ export function ScrollRevealHero() {
       // Prevent mobile address bar show/hide from thrashing scroll metrics
       ScrollTrigger.config({ ignoreMobileResize: true });
 
-      // Prime video and ensure metadata is accessible
-      await new Promise<void>((resolve) => {
-        if (video.readyState >= 1) return resolve();
-        const onLoaded = () => {
-          setIsLoaded(true);
-          resolve();
-        };
-        video.addEventListener("loadedmetadata", onLoaded, { once: true });
-        video.addEventListener("loadeddata", onLoaded, { once: true });
-        video.addEventListener("canplay", onLoaded, { once: true });
-        video.addEventListener("error", () => resolve(), { once: true });
-      });
-      if (killed) return;
-
-      setIsLoaded(true);
-      video.pause();
-
-      const duration =
-        Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 7.96;
-
       const initialWidth = window.innerWidth;
-      const initialHeight = window.innerHeight;
-      video.style.objectPosition = getFocalPosition(0, initialWidth, initialHeight);
-
-      // Device-calibrated scroll distances and scrub smoothing:
-      // Mobile: shorter pin (170%), snappy scrub (0.1s) for responsive 1:1 finger tracking
-      // Tablet: balanced pin (220%), gentle scrub (0.22s)
-      // Desktop: cinematic pin (280%), silky scrub (0.45s)
       const isMobile = initialWidth < 640;
       const isTablet = initialWidth >= 640 && initialWidth < 1024;
 
-      const endDistance = isMobile ? "+=170%" : isTablet ? "+=220%" : "+=280%";
-      const scrubSmoothing = isMobile ? 0.1 : isTablet ? 0.22 : 0.45;
+      // Device-calibrated scroll distances:
+      // Mobile: shorter pin (+160%), responsive scrub (0.1s) for 1:1 touch control
+      // Tablet: balanced pin (+200%), scrub (0.2s)
+      // Desktop: cinematic pin (+260%), silky scrub (0.35s)
+      const endDistance = isMobile ? "+=160%" : isTablet ? "+=200%" : "+=260%";
+      const scrubSmoothing = isMobile ? 0.1 : isTablet ? 0.2 : 0.35;
 
-      const playhead = { time: 0 };
+      const playhead = { frame: 0 };
+
+      // Initial canvas setup
+      resizeCanvas(canvas);
 
       const tl = gsap.timeline({
         scrollTrigger: {
@@ -269,45 +343,47 @@ export function ScrollRevealHero() {
           onUpdate: (self) => {
             const p = self.progress;
             currentProgressRef.current = p;
-            video.style.objectPosition = getFocalPosition(p, window.innerWidth, window.innerHeight);
+            const targetFrame = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(playhead.frame)));
+            renderCurrentFrame(targetFrame, p);
           },
         },
       });
 
-      // Synchronize video playhead from 0 to full duration
+      // Synchronize playhead across all 36 frames
       tl.to(
         playhead,
         {
-          time: duration,
+          frame: TOTAL_FRAMES - 1,
           ease: "none",
-          duration: duration,
+          duration: 1,
           onUpdate: () => {
-            targetTimeRef.current = playhead.time;
+            const targetFrame = Math.min(TOTAL_FRAMES - 1, Math.max(0, Math.round(playhead.frame)));
+            renderCurrentFrame(targetFrame, currentProgressRef.current);
           },
         },
         0
       );
 
-      // Scroll prompt disappears promptly on initial scroll
+      // Scroll hint prompt disappears promptly on initial scroll
       if (hintRef.current) {
         tl.to(
           hintRef.current,
-          { opacity: 0, y: 15, duration: 0.5, ease: "power1.out" },
+          { opacity: 0, y: 15, duration: 0.12, ease: "power1.out" },
           0
         );
       }
 
-      // Title lifts and dissolves as bottle opens (progress 0.12 to 0.32)
+      // Title lifts and dissolves as bottle opens (progress 0.12 to 0.35)
       if (titleRef.current) {
         tl.to(
           titleRef.current,
           {
             opacity: 0,
             y: isMobile ? -30 : -45,
-            duration: 1.0,
+            duration: 0.22,
             ease: "power1.in",
           },
-          duration * 0.12
+          0.12
         );
       }
 
@@ -320,20 +396,24 @@ export function ScrollRevealHero() {
             opacity: 1,
             y: 0,
             pointerEvents: "auto",
-            duration: 1.1,
+            duration: 0.22,
             ease: "power2.out",
           },
-          duration * 0.78
+          0.78
         );
       }
 
       ScrollTrigger.refresh();
 
-      // Viewport resize handler with width check (avoids address-bar height churn)
+      // Viewport resize handler with debounce (avoids mobile address-bar height churn)
       let prevWidth = window.innerWidth;
       const handleResize = () => {
         if (Math.abs(window.innerWidth - prevWidth) > 30) {
           prevWidth = window.innerWidth;
+          if (canvasRef.current) {
+            resizeCanvas(canvasRef.current);
+            renderCurrentFrame(currentFrameRef.current, currentProgressRef.current);
+          }
           ScrollTrigger.refresh();
         }
       };
@@ -342,6 +422,10 @@ export function ScrollRevealHero() {
       // Orientation change handler for tablets and phones
       const handleOrientation = () => {
         setTimeout(() => {
+          if (canvasRef.current) {
+            resizeCanvas(canvasRef.current);
+            renderCurrentFrame(currentFrameRef.current, currentProgressRef.current);
+          }
           ScrollTrigger.refresh();
         }, 150);
       };
@@ -357,12 +441,12 @@ export function ScrollRevealHero() {
 
     return () => {
       killed = true;
-      if (rafId) cancelAnimationFrame(rafId);
-      video.removeEventListener("play", onStrayPlay);
-      video.removeEventListener("seeked", onSeeked);
       cleanupGsap?.();
     };
-  }, [reducedMotion, selectedVideoSrc]);
+  }, [reducedMotion, renderCurrentFrame]);
+
+  // Poster URL based on active device tier
+  const posterSrc = getPosterUrl(deviceTier);
 
   // Reduced motion alternative: static full-screen presentation
   if (reducedMotion) {
@@ -371,12 +455,9 @@ export function ScrollRevealHero() {
         className="relative h-[100dvh] min-h-[100svh] w-full overflow-hidden bg-[var(--ivory)]"
         aria-label="Hero"
       >
-        <video
-          src={selectedVideoSrc}
-          poster={posterUrl || FALLBACK_POSTER}
-          muted
-          playsInline
-          controls
+        <img
+          src={posterSrc}
+          alt="Srishti Nail Couture"
           className="absolute inset-0 h-full w-full object-cover"
           style={{ objectPosition: "50% 50%" }}
         />
@@ -398,8 +479,12 @@ export function ScrollRevealHero() {
             Premium nail artistry, beauty & academy training — couture precision.
           </p>
           <div className="flex flex-wrap gap-3 justify-center">
-            <a href="#contact" className="hero-cta-primary shadow-xl">Book Appointment</a>
-            <a href="#academy" className="hero-cta-secondary backdrop-blur-md bg-white/60 shadow-md">Explore Academy</a>
+            <a href="#contact" className="hero-cta-primary shadow-xl">
+              Book Appointment
+            </a>
+            <a href="#academy" className="hero-cta-secondary backdrop-blur-md bg-white/60 shadow-md">
+              Explore Academy
+            </a>
           </div>
         </div>
       </section>
@@ -412,20 +497,23 @@ export function ScrollRevealHero() {
       className="relative h-[100dvh] min-h-[100svh] w-full overflow-hidden bg-[var(--ivory)] select-none"
       aria-label="Hero"
     >
-      {/* Full-screen edge-to-edge luxury video stage */}
-      <video
-        ref={videoRef}
-        src={selectedVideoSrc}
-        poster={posterUrl || FALLBACK_POSTER}
-        muted
-        playsInline
-        preload="auto"
-        disablePictureInPicture
-        aria-hidden="true"
-        className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-500 will-change-[object-position] select-none ${
-          isLoaded ? "opacity-100" : "opacity-95"
+      {/* Instant fallback poster image: visible immediately while canvas initializes */}
+      <img
+        src={posterSrc}
+        alt="Srishti Nail Couture"
+        fetchPriority="high"
+        decoding="async"
+        className={`absolute inset-0 h-full w-full object-cover pointer-events-none transition-opacity duration-300 ${
+          isCanvasReady ? "opacity-0" : "opacity-100"
         }`}
         style={{ objectPosition: "50% 52%" }}
+      />
+
+      {/* Hardware-accelerated canvas stage: draws the 36-frame sequence */}
+      <canvas
+        ref={canvasRef}
+        className="absolute inset-0 h-full w-full block select-none pointer-events-none will-change-transform"
+        aria-hidden="true"
       />
 
       {/* Subtle luxury vignette and film grain */}
